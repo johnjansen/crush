@@ -14,6 +14,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -21,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"charm.land/catwalk/pkg/catwalk"
@@ -55,6 +57,28 @@ const (
 	smallContextWindowRatio     = 0.2
 )
 
+// Stream-stall watchdog tuning. Declared as vars (not consts) so tests can
+// lower them; production code never mutates them.
+var (
+	// streamIdleTimeout is the maximum gap between LLM-stream callbacks
+	// (text/tool/reasoning deltas, tool calls, tool results) before we
+	// consider the provider stream stalled and cancel genCtx so the
+	// session can recover. Calibrated to be longer than any plausible
+	// "model is thinking" pause and shorter than a user's patience.
+	streamIdleTimeout = 120 * time.Second
+
+	// streamIdleTick is how often the stall watchdog re-checks the
+	// last-activity timestamp. Coarser than the timeout — we only need
+	// to catch the stall within ~tick of the deadline.
+	streamIdleTick = 5 * time.Second
+
+	// transientErrMaxRetries caps how many times Run will auto-recurse
+	// after a transient connection error (broken pipe, EOF mid-stream,
+	// connection reset). Set to 1 — one extra "free" attempt mirrors
+	// what users do manually by typing "continue" after a network blip.
+	transientErrMaxRetries = 1
+)
+
 var userAgent = fmt.Sprintf("Charm-Crush/%s (https://charm.land/crush)", version.Version)
 
 //go:embed templates/title.md
@@ -81,6 +105,13 @@ type SessionAgentCall struct {
 	FrequencyPenalty *float64
 	PresencePenalty  *float64
 	NonInteractive   bool
+
+	// RetryCount tracks how many times this call has been auto-retried
+	// after a transient connection error (broken pipe, EOF, connection
+	// reset). Internal use only — external callers leave it 0. Each
+	// retry suppresses user-message creation since the original prompt
+	// was already persisted on the first attempt.
+	RetryCount int
 }
 
 type SessionAgent interface {
@@ -231,10 +262,15 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 	}
 	defer wg.Wait()
 
-	// Add the user message to the session.
-	_, err = a.createUserMessage(ctx, call)
-	if err != nil {
-		return nil, err
+	// Add the user message to the session, unless this is an auto-retry
+	// after a transient connection error — the user message was already
+	// persisted on the first attempt and re-creating it would duplicate
+	// it in the session history.
+	if call.RetryCount == 0 {
+		_, err = a.createUserMessage(ctx, call)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// Add the session to the context.
@@ -245,6 +281,12 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 
 	defer cancel()
 	defer a.activeRequests.Del(call.SessionID)
+
+	// Detect mid-stream stalls (provider goes silent without erroring).
+	// On stall the watchdog cancels genCtx so fantasy.Stream returns
+	// context.Canceled and we surface a recoverable error to the user.
+	watchdog := newStallWatchdog(genCtx, cancel, call.SessionID, streamIdleTimeout, streamIdleTick)
+	defer watchdog.stop()
 
 	history, files := a.preparePrompt(msgs, largeModel.CatwalkCfg.SupportsImages, call.Attachments...)
 
@@ -327,14 +369,17 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 			return callContext, prepared, err
 		},
 		OnReasoningStart: func(id string, reasoning fantasy.ReasoningContent) error {
+			watchdog.ping()
 			currentAssistant.AppendReasoningContent(reasoning.Text)
 			return a.messages.Update(genCtx, *currentAssistant)
 		},
 		OnReasoningDelta: func(id string, text string) error {
+			watchdog.ping()
 			currentAssistant.AppendReasoningContent(text)
 			return a.messages.Update(genCtx, *currentAssistant)
 		},
 		OnReasoningEnd: func(id string, reasoning fantasy.ReasoningContent) error {
+			watchdog.ping()
 			// handle anthropic signature
 			if anthropicData, ok := reasoning.ProviderMetadata[anthropic.Name]; ok {
 				if reasoning, ok := anthropicData.(*anthropic.ReasoningOptionMetadata); ok {
@@ -355,6 +400,7 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 			return a.messages.Update(genCtx, *currentAssistant)
 		},
 		OnTextDelta: func(id string, text string) error {
+			watchdog.ping()
 			// Strip leading newline from initial text content. This is is
 			// particularly important in non-interactive mode where leading
 			// newlines are very visible.
@@ -366,6 +412,7 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 			return a.messages.Update(genCtx, *currentAssistant)
 		},
 		OnToolInputStart: func(id string, toolName string) error {
+			watchdog.ping()
 			toolCall := message.ToolCall{
 				ID:               id,
 				Name:             toolName,
@@ -378,9 +425,11 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 			return a.messages.Update(ctx, *currentAssistant)
 		},
 		OnRetry: func(err *fantasy.ProviderError, delay time.Duration) {
+			watchdog.ping()
 			slog.Warn("Provider request failed, retrying", providerRetryLogFields(err, delay)...)
 		},
 		OnToolCall: func(tc fantasy.ToolCallContent) error {
+			watchdog.ping()
 			toolCall := message.ToolCall{
 				ID:               tc.ToolCallID,
 				Name:             tc.ToolName,
@@ -394,6 +443,7 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 			return a.messages.Update(ctx, *currentAssistant)
 		},
 		OnToolResult: func(result fantasy.ToolResultContent) error {
+			watchdog.ping()
 			toolResult := a.convertToToolResult(result)
 			// Use parent ctx instead of genCtx to ensure the message is created
 			// even if the request is canceled mid-stream
@@ -406,6 +456,7 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 			return createMsgErr
 		},
 		OnStepFinish: func(stepResult fantasy.StepResult) error {
+			watchdog.ping()
 			finishReason := message.FinishReasonUnknown
 			switch stepResult.FinishReason {
 			case fantasy.FinishReasonLength:
@@ -476,7 +527,29 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 	if err != nil {
 		isHyper := largeModel.ModelCfg.Provider == hyper.Name
 		isCancelErr := errors.Is(err, context.Canceled)
+		isStallErr := isCancelErr && watchdog.didStall()
+		// Transient connection failures (broken pipe, EOF mid-stream,
+		// connection reset) are treated as recoverable: surface a
+		// readable finish reason on the assistant turn and recurse Run
+		// with RetryCount+1 to give the model one free attempt before
+		// bothering the user.
+		isTransientErr := !isStallErr && !isCancelErr && isTransientConnError(err)
 		if currentAssistant == nil {
+			if isStallErr {
+				return result, ErrStreamStalled
+			}
+			if isTransientErr && call.RetryCount < transientErrMaxRetries {
+				slog.Warn("Transient connection error before stream started; retrying",
+					"session_id", call.SessionID,
+					"retry", call.RetryCount+1,
+					"err", err,
+				)
+				retryCall := call
+				retryCall.RetryCount++
+				a.activeRequests.Del(call.SessionID)
+				cancel()
+				return a.Run(ctx, retryCall)
+			}
 			return result, err
 		}
 		// Ensure we finish thinking on error to close the reasoning state.
@@ -516,7 +589,12 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 				continue
 			}
 			content := "There was an error while executing the tool"
-			if isCancelErr {
+			switch {
+			case isStallErr:
+				content = "Error: provider stream stalled; tool call did not complete"
+			case isTransientErr:
+				content = "Error: provider connection dropped; tool call did not complete"
+			case isCancelErr:
 				content = "Error: user cancelled assistant tool calling"
 			}
 			toolResult := message.ToolResult{
@@ -539,9 +617,28 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 		var providerErr *fantasy.ProviderError
 		const defaultTitle = "Provider Error"
 		linkStyle := lipgloss.NewStyle().Foreground(charmtone.Guac).Underline(true)
-		if isCancelErr {
+		switch {
+		case isStallErr:
+			currentAssistant.AddFinish(
+				message.FinishReasonError,
+				"Stream stalled",
+				fmt.Sprintf("The provider stopped sending data for %s with no error. Send another message (e.g. \"continue\") to resume from where the agent left off.", streamIdleTimeout),
+			)
+		case isTransientErr && call.RetryCount < transientErrMaxRetries:
+			currentAssistant.AddFinish(
+				message.FinishReasonError,
+				"Connection dropped — retrying",
+				"The provider connection was interrupted by a network error. Retrying automatically.",
+			)
+		case isTransientErr:
+			currentAssistant.AddFinish(
+				message.FinishReasonError,
+				"Connection dropped",
+				"The provider connection was interrupted by a network error and the automatic retry also failed. Send another message (e.g. \"continue\") to resume from where the agent left off.",
+			)
+		case isCancelErr:
 			currentAssistant.AddFinish(message.FinishReasonCanceled, "User canceled request", "")
-		} else if isHyper && errors.As(err, &providerErr) && providerErr.StatusCode == http.StatusUnauthorized {
+		case isHyper && errors.As(err, &providerErr) && providerErr.StatusCode == http.StatusUnauthorized:
 			currentAssistant.AddFinish(message.FinishReasonError, "Unauthorized", `Please re-authenticate with Hyper. You can also run "crush auth" to re-authenticate.`)
 			if a.notify != nil {
 				a.notify.Publish(pubsub.CreatedEvent, notify.Notification{
@@ -551,11 +648,11 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 					ProviderID:   largeModel.ModelCfg.Provider,
 				})
 			}
-		} else if isHyper && errors.As(err, &providerErr) && providerErr.StatusCode == http.StatusPaymentRequired {
+		case isHyper && errors.As(err, &providerErr) && providerErr.StatusCode == http.StatusPaymentRequired:
 			url := hyper.BaseURL()
 			link := linkStyle.Hyperlink(url, "id=hyper").Render(url)
 			currentAssistant.AddFinish(message.FinishReasonError, "No credits", "You're out of credits. Add more at "+link)
-		} else if errors.As(err, &providerErr) {
+		case errors.As(err, &providerErr):
 			if providerErr.Message == "The requested model is not supported." {
 				url := "https://github.com/settings/copilot/features"
 				link := linkStyle.Hyperlink(url, "id=copilot").Render(url)
@@ -567,9 +664,9 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 			} else {
 				currentAssistant.AddFinish(message.FinishReasonError, cmp.Or(stringext.Capitalize(providerErr.Title), defaultTitle), providerErr.Message)
 			}
-		} else if errors.As(err, &fantasyErr) {
+		case errors.As(err, &fantasyErr):
 			currentAssistant.AddFinish(message.FinishReasonError, cmp.Or(stringext.Capitalize(fantasyErr.Title), defaultTitle), fantasyErr.Message)
-		} else {
+		default:
 			currentAssistant.AddFinish(message.FinishReasonError, defaultTitle, err.Error())
 		}
 		// Note: we use the parent context here because the genCtx has been
@@ -577,6 +674,27 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 		updateErr := a.messages.Update(ctx, *currentAssistant)
 		if updateErr != nil {
 			return nil, updateErr
+		}
+		if isStallErr {
+			return nil, ErrStreamStalled
+		}
+		// Auto-retry on transient connection errors. The orphaned
+		// tool-call repair in preparePrompt will inject synthetic
+		// tool_result entries on the recursive call so the model sees a
+		// clean conversation history. We release the active request
+		// before recursing so the second attempt can re-claim it.
+		if isTransientErr && call.RetryCount < transientErrMaxRetries {
+			slog.Warn("Transient connection error mid-stream; retrying once",
+				"session_id", call.SessionID,
+				"retry", call.RetryCount+1,
+				"err", err,
+			)
+			retryCall := call
+			retryCall.RetryCount++
+			a.activeRequests.Del(call.SessionID)
+			cancel()
+			watchdog.stop()
+			return a.Run(ctx, retryCall)
 		}
 		return nil, err
 	}
@@ -1399,4 +1517,22 @@ func providerRetryLogFields(err *fantasy.ProviderError, delay time.Duration) []a
 		fields = append(fields, "message", err.Message)
 	}
 	return fields
+}
+
+// isTransientConnError reports whether err looks like a transient network
+// failure on the provider HTTP connection (broken pipe, EOF mid-stream,
+// closed pipe, connection reset). Bedrock/Anthropic does not wrap these
+// into a retryable ProviderError, so they otherwise surface to the user as
+// a cryptic "Provider Error: write tcp ...: broken pipe". The detection
+// is pure errors.Is on well-defined sentinels so false positives are
+// effectively impossible.
+func isTransientConnError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, io.ErrClosedPipe) ||
+		errors.Is(err, syscall.EPIPE) ||
+		errors.Is(err, syscall.ECONNRESET)
 }
